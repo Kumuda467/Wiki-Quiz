@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage } from "./storage";
+import { getStorage } from "./storage";
 import { api } from "@shared/routes";
 import { insertWikiQuizSchema, type InsertWikiQuiz } from "@shared/schema";
 import { z } from "zod";
@@ -56,40 +56,68 @@ function extractFromHtml(html: string, url: string): {
   const rawTitle = titleMatch ? titleMatch[1] : "Wikipedia Article";
   const title = stripCitations(rawTitle.replace(/<[^>]+>/g, " "));
 
-  const bodyMatch = html.match(/<div[^>]*id="mw-content-text"[^>]*>([\s\S]*?)<\/div>/i);
-  const body = bodyMatch ? bodyMatch[1] : html;
+  // Try multiple patterns to find the content
+  let body = html;
+  const bodyMatch = html.match(/<div[^>]*id="mw-content-text"[^>]*>([\s\S]*?)(?:<div[^>]*id="mw-navigation"|<\/div>\s*<\/div>)/i);
+  if (bodyMatch) {
+    body = bodyMatch[1];
+  } else {
+    // Fallback: get the larger content area
+    const altMatch = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+    if (altMatch) {
+      body = altMatch[1];
+    }
+  }
 
-  const sectionMatches = Array.from(body.matchAll(/<h2[^>]*>\s*(?:<span[^>]*>\s*)?<span[^>]*class="mw-headline"[^>]*>([\s\S]*?)<\/span>/gi));
+  // Extract sections
+  const sectionMatches = Array.from(body.matchAll(/<h2[^>]*>\s*(?:<span[^>]*>\s*)?<span[^>]*class="mw-headline"[^>]*id="[^"]*"[^>]*>([\s\S]*?)<\/span>/gi));
   const sections = sectionMatches
     .map((m) => stripCitations(m[1].replace(/<[^>]+>/g, " ")))
     .filter(Boolean)
     .slice(0, 20);
 
+  // If no sections found, try alternative pattern
+  if (sections.length === 0) {
+    const altSections = Array.from(body.matchAll(/<h(?:2|3)[^>]*>([\s\S]*?)<\/h(?:2|3)>/gi));
+    altSections.forEach(m => {
+      const text = stripCitations(m[1].replace(/<[^>]+>/g, " ")).trim();
+      if (text && text.length > 0 && sections.length < 20) {
+        sections.push(text);
+      }
+    });
+  }
+
+  // Extract paragraphs
   const pMatches = Array.from(body.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi));
   const paragraphs = pMatches
-    .map((m) => stripCitations(m[1].replace(/<[^>]+>/g, " ")))
+    .map((m) => stripCitations(m[1].replace(/<[^>]+>/g, " ")).trim())
     .filter((p) => p.length > 50);
+  
   const plainText = paragraphs.join("\n\n");
-  const summary = summarize(paragraphs.slice(0, 2).join(" "), 500);
+  const summary = summarize(paragraphs.slice(0, 3).join(" "), 500);
 
   // Lightweight entity guess: collect linked page titles from first ~50 links.
-  const linkMatches = Array.from(body.matchAll(/<a[^>]*href="\/wiki\/([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi));
+  const linkMatches = Array.from(body.matchAll(/<a[^>]*href="\/wiki\/([^"]+)"[^>]*title="[^"]*"[^>]*>([\s\S]*?)<\/a>/gi));
   const candidates = linkMatches
-    .map((m) => decodeURIComponent(m[1]).replace(/_/g, " "))
-    .filter((t) => !t.includes(":") && t.length > 1)
+    .map((m) => {
+      const linkText = stripCitations(m[2].replace(/<[^>]+>/g, " ")).trim();
+      return linkText || decodeURIComponent(m[1]).replace(/_/g, " ");
+    })
+    .filter((t) => !t.includes(":") && t.length > 1 && t.length < 100)
     .slice(0, 80);
+  
   const uniq = Array.from(new Set(candidates));
   const people = uniq.filter((t) => /\b[A-Z][a-z]+\b/.test(t) && t.split(" ").length >= 2).slice(0, 10);
-  const organizations = uniq.filter((t) => /(University|Institute|Company|Corporation|Agency|Committee|Organization|Park|Laboratory)\b/i.test(t)).slice(0, 10);
-  const locations = uniq.filter((t) => /(Kingdom|United States|England|London|France|Germany|Italy|India|China|Japan|City|County|Province|State)\b/i.test(t)).slice(0, 10);
+  const organizations = uniq.filter((t) => /(University|Institute|Company|Corporation|Agency|Committee|Organization|Park|Laboratory|Museum|Library|Foundation|Trust|School|College)\b/i.test(t)).slice(0, 10);
+  const locations = uniq.filter((t) => /(Kingdom|United States|England|London|France|Germany|Italy|India|China|Japan|City|County|Province|State|Region|District|County|Borough)\b/i.test(t)).slice(0, 10);
 
   return {
     url,
     title,
-    summary,
-    sections,
+    summary: summary || "A Wikipedia article",
+    sections: sections.length > 0 ? sections : ["Overview", "History", "References"],
     keyEntities: { people, organizations, locations },
-    plainText,
+    plainText: plainText || title,
   };
 }
 
@@ -216,6 +244,8 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Please provide a valid Wikipedia article URL.", field: "url" });
       }
 
+      const storage = getStorage();
+
       if (!input.forceRegenerate) {
         const existing = await storage.getQuizByUrl(input.url);
         if (existing) {
@@ -244,7 +274,7 @@ export async function registerRoutes(
         relatedTopics,
         contentHash: hash,
         rawHtml: input.storeRawHtml ? html : null,
-      } satisfies InsertWikiQuiz);
+      });
 
       const created = await storage.createQuiz(toInsert);
       res.status(201).json(created);
@@ -260,12 +290,14 @@ export async function registerRoutes(
   });
 
   app.get(api.wiki.history.path, async (req, res) => {
+    const storage = getStorage();
     const q = typeof req.query.q === "string" ? req.query.q : undefined;
     const rows = await storage.getHistory({ q });
     res.json(rows);
   });
 
   app.get(api.wiki.get.path, async (req, res) => {
+    const storage = getStorage();
     const id = String(req.params.id);
     const quiz = await storage.getQuiz(id);
     if (!quiz) {
