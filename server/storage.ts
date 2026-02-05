@@ -1,38 +1,66 @@
-import { type User, type InsertUser } from "@shared/schema";
-import { randomUUID } from "crypto";
+import { db } from "./db";
+import { wikiQuizzes, type InsertWikiQuiz, type WikiQuiz } from "@shared/schema";
+import { eq, ilike, or, desc } from "drizzle-orm";
 
 // modify the interface with any CRUD methods
 // you might need
 
 export interface IStorage {
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  getHistory(query?: { q?: string }): Promise<
+    { id: string; url: string; title: string; createdAt: number }[]
+  >;
+  getQuiz(id: string): Promise<WikiQuiz | undefined>;
+  getQuizByUrl(url: string): Promise<WikiQuiz | undefined>;
+  createQuiz(quiz: InsertWikiQuiz): Promise<WikiQuiz>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
+export class DatabaseStorage implements IStorage {
+  async getHistory(query?: { q?: string }): Promise<
+    { id: string; url: string; title: string; createdAt: number }[]
+  > {
+    const q = query?.q?.trim();
 
-  constructor() {
-    this.users = new Map();
+    if (!q) {
+      return await db
+        .select({
+          id: wikiQuizzes.id,
+          url: wikiQuizzes.url,
+          title: wikiQuizzes.title,
+          createdAt: wikiQuizzes.createdAt,
+        })
+        .from(wikiQuizzes)
+        .orderBy(desc(wikiQuizzes.createdAt));
+    }
+
+    return await db
+      .select({
+        id: wikiQuizzes.id,
+        url: wikiQuizzes.url,
+        title: wikiQuizzes.title,
+        createdAt: wikiQuizzes.createdAt,
+      })
+      .from(wikiQuizzes)
+      .where(or(ilike(wikiQuizzes.title, `%${q}%`), ilike(wikiQuizzes.url, `%${q}%`)))
+      .orderBy(desc(wikiQuizzes.createdAt));
   }
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+  async getQuiz(id: string): Promise<WikiQuiz | undefined> {
+    const [row] = await db.select().from(wikiQuizzes).where(eq(wikiQuizzes.id, id));
+    return row || undefined;
   }
 
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
+  async getQuizByUrl(url: string): Promise<WikiQuiz | undefined> {
+    const [row] = await db
+      .select()
+      .from(wikiQuizzes)
+      .where(eq(wikiQuizzes.url, url));
+    return row || undefined;
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
-    return user;
+  async createQuiz(quiz: InsertWikiQuiz): Promise<WikiQuiz> {
+    const [row] = await db.insert(wikiQuizzes).values(quiz).returning();
+    return row;
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();
